@@ -1,0 +1,77 @@
+# A800-SXM4-40GB + YOLOv5 P6 模型优化配置
+# P6 模型: 支持 1280x1280 输入，4 个检测层 (P3/8, P4/16, P5/32, P6/64)
+# 使用方法: python train_rtx5090.py --model-size m6 --weights yolov5m6.pt --data data/coco.yaml
+
+# ==================== 学习率策略 ====================
+# A800 显存充足，可用更大 batch，学习率相应调整
+lr0: 0.01               # 初始学习率
+lrf: 0.01               # 最终学习率系数
+momentum: 0.937         # SGD momentum
+weight_decay: 0.0005    # 权重衰减
+
+# ==================== Warmup 策略 ====================
+warmup_epochs: 3.0      # P6 模型 warmup
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+
+# ==================== 损失函数权重 ====================
+box: 0.05
+cls: 0.3
+obj: 0.7
+cls_pw: 1.0
+obj_pw: 1.0
+fl_gamma: 0.0
+label_smoothing: 0.0
+
+# ==================== 锚框策略 ====================
+anchor_t: 4.0
+iou_t: 0.20
+
+# ==================== 数据增强 ====================
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+
+degrees: 0.0
+translate: 0.1
+scale: 0.9
+shear: 0.0
+perspective: 0.0
+
+flipud: 0.0
+fliplr: 0.5
+
+mosaic: 1.0
+mixup: 0.15
+copy_paste: 0.1
+
+# ==================== P6 模型推荐配置 (A800 40GB) ====================
+# 推荐 Batch Size (1280x1280):
+#
+# YOLOv5n6: batch 96,  val_batch 192  (~22GB)
+# YOLOv5s6: batch 72,  val_batch 144  (~26GB)
+# YOLOv5m6: batch 48,  val_batch 96   (~30GB)  ← 推荐
+# YOLOv5l6: batch 32,  val_batch 64   (~34GB)
+# YOLOv5x6: batch 24,  val_batch 48   (~38GB)
+#
+# 完整训练命令:
+#
+# python train_rtx5090.py \
+#   --model-size m6 \
+#   --weights yolov5m6.pt \
+#   --data data/coco.yaml \
+#   --epochs 300
+#
+# A800 可用更大 batch:
+#
+# python train.py \
+#   --cfg models/hub/yolov5m6.yaml \
+#   --hyp configs/a800_p6_optimal.yaml \
+#   --weights yolov5m6.pt \
+#   --data data/coco.yaml \
+#   --img 1280 \
+#   --batch 48 \
+#   --val-batch 96 \
+#   --workers 24 \
+#   --device 0 \
+#   --amp --ema --cos-lr

@@ -1,0 +1,14 @@
+path: data
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 1
+names: ['fire']
+
+roboflow:
+  workspace: migue
+  project: -yuk3f
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/migue/-yuk3f/dataset/1
