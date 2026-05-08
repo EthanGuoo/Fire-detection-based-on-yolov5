@@ -1,0 +1,6 @@
+train: F:/BaiduNetdiskDownload/train/images
+val: F:/BaiduNetdiskDownload/valid/images
+nc: 2
+names:
+- fire
+- smoke
