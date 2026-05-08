@@ -1,8 +1,11 @@
+import csv
 import json
 import math
+import os
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -24,15 +27,23 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QScrollArea,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +55,83 @@ from utils.plots import Annotator, colors
 from utils.torch_utils import select_device, smart_inference_mode
 
 cv2 = yolov5_cv2
+
+try:
+    from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFont as _PILFont
+    _PIL_AVAILABLE = True
+except Exception:
+    _PIL_AVAILABLE = False
+
+
+def _find_cjk_font() -> Optional[str]:
+    """定位一个支持中文的 TTF / TTC 字体。"""
+    candidates = [
+        r'C:\Windows\Fonts\msyh.ttc',
+        r'C:\Windows\Fonts\msyh.ttf',
+        r'C:\Windows\Fonts\msyhbd.ttc',
+        r'C:\Windows\Fonts\simhei.ttf',
+        r'C:\Windows\Fonts\simsun.ttc',
+        '/System/Library/Fonts/PingFang.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+    ]
+    for p in candidates:
+        if Path(p).exists():
+            return p
+    return None
+
+
+_CJK_FONT_PATH = _find_cjk_font()
+_CJK_FONT_CACHE: Dict[int, object] = {}
+
+
+def _get_cjk_font(size: int):
+    if not _PIL_AVAILABLE or _CJK_FONT_PATH is None:
+        return None
+    font = _CJK_FONT_CACHE.get(size)
+    if font is None:
+        try:
+            font = _PILFont.truetype(_CJK_FONT_PATH, size)
+            _CJK_FONT_CACHE[size] = font
+        except Exception:
+            return None
+    return font
+
+
+def draw_text_cn(
+    image: np.ndarray,
+    text: str,
+    org: Tuple[int, int],
+    font_size: int = 22,
+    color_bgr: Tuple[int, int, int] = (0, 255, 255),
+) -> np.ndarray:
+    """在 OpenCV BGR 图像上绘制中文文字（仅渲染文字区域，性能友好）。"""
+    font = _get_cjk_font(font_size)
+    if font is None:
+        cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_size / 30.0, color_bgr, 2, cv2.LINE_AA)
+        return image
+
+    color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+    bbox = font.getbbox(text)
+    tw = bbox[2] - bbox[0] + 4
+    th = bbox[3] - bbox[1] + 4
+    if tw <= 0 or th <= 0:
+        return image
+
+    x0, y0 = int(org[0]), int(org[1])
+    h, w = image.shape[:2]
+    x1 = min(x0 + tw, w)
+    y1 = min(y0 + th, h)
+    if x0 >= w or y0 >= h or x1 <= x0 or y1 <= y0:
+        return image
+
+    roi = image[y0:y1, x0:x1]
+    roi_rgb = roi[:, :, ::-1].copy()
+    pil_roi = _PILImage.fromarray(roi_rgb)
+    draw = _PILDraw.Draw(pil_roi)
+    draw.text((-bbox[0], -bbox[1]), text, font=font, fill=color_rgb)
+    image[y0:y1, x0:x1] = np.array(pil_roi)[:, :, ::-1]
+    return image
 
 
 class MultiSourceCapture:
@@ -88,11 +176,25 @@ class MultiSourceCapture:
         cap.release()
         return None
 
+    def _open_camera_url(self, url: str) -> Optional[cv2.VideoCapture]:
+        cap = cv2.VideoCapture(url)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+            cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+            ok, _ = cap.read()
+            if ok:
+                return cap
+        cap.release()
+        return None
+
     def _open_all(self) -> None:
         for src in self.sources:
             cap = None
             if src["type"] == "camera":
                 cap = self._open_camera(int(src["value"]))
+            elif src["type"] == "camera_url":
+                cap = self._open_camera_url(str(src["value"]))
             elif src["type"] == "video":
                 cap = self._open_video(str(src["value"]))
 
@@ -125,6 +227,455 @@ class MultiSourceCapture:
         self.caps = []
 
 
+class CameraRow(QFrame):
+    """单台摄像头的卡片行，包含启用开关、名称、地址、重命名/删除按钮。"""
+
+    toggled = Signal(int, bool)
+    rename_requested = Signal(int)
+    remove_requested = Signal(int)
+
+    def __init__(self, index: int, cam: dict, parent=None):
+        super().__init__(parent)
+        self.index = index
+        self.setObjectName('cameraRow')
+        self.setStyleSheet(
+            """
+            QFrame#cameraRow {
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 14px;
+            }
+            QFrame#cameraRow:hover {
+                background: rgba(123, 156, 255, 0.10);
+                border: 1px solid rgba(123, 156, 255, 0.38);
+            }
+            """
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 10, 12, 10)
+        layout.setSpacing(12)
+
+        icon = QLabel(self)
+        icon.setFixedSize(40, 40)
+        icon_color = '#7fb2ff' if cam.get('type') == 'camera' else '#b784ff'
+        icon_text = '本' if cam.get('type') == 'camera' else '网'
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setText(icon_text)
+        icon.setStyleSheet(
+            f'background: rgba(123, 156, 255, 0.14); border: 1px solid {icon_color}55; '
+            f'border-radius: 20px; color: {icon_color}; font-size: 14px; font-weight: 800;'
+        )
+        layout.addWidget(icon)
+
+        text_box = QVBoxLayout()
+        text_box.setContentsMargins(0, 0, 0, 0)
+        text_box.setSpacing(2)
+        self.name_label = QLabel(cam.get('name', ''), self)
+        self.name_label.setStyleSheet('color:#f5f8ff; font-size:14px; font-weight:700;')
+        self.addr_label = QLabel(self._format_addr(cam), self)
+        self.addr_label.setStyleSheet('color:#9fb1d6; font-size:12px;')
+        self.addr_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        text_box.addWidget(self.name_label)
+        text_box.addWidget(self.addr_label)
+        layout.addLayout(text_box, 1)
+
+        self.enable_btn = QPushButton(self)
+        self.enable_btn.setCheckable(True)
+        self.enable_btn.setChecked(bool(cam.get('enabled', True)))
+        self.enable_btn.setCursor(Qt.PointingHandCursor)
+        self.enable_btn.setFixedSize(72, 32)
+        self._refresh_enable_text()
+        self.enable_btn.setStyleSheet(
+            """
+            QPushButton {
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 16px;
+                color: #cfd9f0;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 0 10px;
+            }
+            QPushButton:checked {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(86, 117, 255, 0.98), stop:1 rgba(85, 201, 255, 0.98));
+                border: 1px solid rgba(255, 255, 255, 0.30);
+                color: #ffffff;
+            }
+            QPushButton:hover {
+                border: 1px solid rgba(123, 156, 255, 0.48);
+            }
+            """
+        )
+        self.enable_btn.toggled.connect(self._on_toggle)
+        layout.addWidget(self.enable_btn)
+
+        self.rename_btn = self._make_tool_btn('改名')
+        self.remove_btn = self._make_tool_btn('删除', danger=True)
+        self.rename_btn.clicked.connect(lambda: self.rename_requested.emit(self.index))
+        self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self.index))
+        layout.addWidget(self.rename_btn)
+        layout.addWidget(self.remove_btn)
+
+    def _make_tool_btn(self, text: str, danger: bool = False) -> QPushButton:
+        btn = QPushButton(text, self)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedSize(54, 32)
+        base = 'rgba(255, 122, 134, 0.22)' if danger else 'rgba(255, 255, 255, 0.05)'
+        border = 'rgba(255, 122, 134, 0.55)' if danger else 'rgba(255, 255, 255, 0.18)'
+        hover = 'rgba(255, 122, 134, 0.35)' if danger else 'rgba(123, 156, 255, 0.22)'
+        color = '#ffd8dd' if danger else '#dbe4fa'
+        btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background: {base};
+                border: 1px solid {border};
+                border-radius: 16px;
+                color: {color};
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                background: {hover};
+            }}
+            """
+        )
+        return btn
+
+    @staticmethod
+    def _format_addr(cam: dict) -> str:
+        if cam.get('type') == 'camera':
+            return f"本机 USB  ·  设备编号 {cam.get('value')}"
+        return f"网络流  ·  {cam.get('value')}"
+
+    def _refresh_enable_text(self):
+        self.enable_btn.setText('已启用' if self.enable_btn.isChecked() else '未启用')
+
+    def _on_toggle(self, checked: bool):
+        self._refresh_enable_text()
+        self.toggled.emit(self.index, checked)
+
+    def update_cam(self, cam: dict):
+        self.name_label.setText(cam.get('name', ''))
+        self.addr_label.setText(self._format_addr(cam))
+        self.enable_btn.blockSignals(True)
+        self.enable_btn.setChecked(bool(cam.get('enabled', True)))
+        self._refresh_enable_text()
+        self.enable_btn.blockSignals(False)
+
+
+class CameraManagerDialog(QDialog):
+    """摄像头管理对话框：扫描、添加、重命名、删除、选择启用。"""
+
+    RESOLUTIONS = ['640x480', '1280x720', '1600x900', '1920x1080']
+
+    def __init__(self, cameras: List[dict], resolution: Tuple[int, int], fps: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('摄像头管理')
+        self.setMinimumSize(560, 540)
+        self.resize(620, 600)
+        self.cameras: List[dict] = [dict(c) for c in cameras]
+        self._rows: List[CameraRow] = []
+
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #0a1324, stop:1 #10203c);
+                color: #eef3ff;
+            }
+            QLabel { color: #eef3ff; font-size: 13px; }
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical {
+                background: rgba(255, 255, 255, 0.03);
+                width: 10px; border-radius: 5px; margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(123, 156, 255, 0.35);
+                border-radius: 5px; min-height: 24px;
+            }
+            QScrollBar::handle:vertical:hover { background: rgba(123, 156, 255, 0.55); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QComboBox, QSpinBox {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                border-radius: 10px;
+                color: #f2f5ff;
+                padding: 6px 10px;
+                min-height: 26px;
+            }
+            QComboBox:hover, QSpinBox:hover { border-color: rgba(123, 156, 255, 0.55); }
+            QComboBox QAbstractItemView {
+                background: #0f1a30;
+                color: #eef3ff;
+                selection-background-color: rgba(86, 117, 255, 0.55);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                outline: 0;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 18px;
+                background: rgba(255, 255, 255, 0.05);
+                border: none;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background: rgba(123, 156, 255, 0.30);
+            }
+            """
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 22, 22, 22)
+        root.setSpacing(16)
+
+        header = QVBoxLayout()
+        header.setSpacing(4)
+        title = QLabel('摄像头管理', self)
+        title.setStyleSheet('color:#ffffff; font-size:20px; font-weight:800; letter-spacing:1px;')
+        subtitle = QLabel('支持本机 USB 设备与网络摄像头（RTSP / HTTP），启用后点击一键接通立即开始检测。', self)
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet('color:#9fb1d6; font-size:12px;')
+        header.addWidget(title)
+        header.addWidget(subtitle)
+        root.addLayout(header)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(10)
+        self.btn_scan = self._make_primary_btn('扫描本机设备', '#5d7cff', '#4aa5ff')
+        self.btn_add_url = self._make_primary_btn('添加网络摄像头', '#8a5dff', '#5dc6ff')
+        action_row.addWidget(self.btn_scan)
+        action_row.addWidget(self.btn_add_url)
+        action_row.addStretch(1)
+        self.count_label = QLabel('', self)
+        self.count_label.setStyleSheet('color:#9fb1d6; font-size:12px;')
+        action_row.addWidget(self.count_label)
+        root.addLayout(action_row)
+
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_container = QWidget(self.scroll_area)
+        self.rows_layout = QVBoxLayout(self.scroll_container)
+        self.rows_layout.setContentsMargins(4, 4, 4, 4)
+        self.rows_layout.setSpacing(10)
+        self.rows_layout.addStretch(1)
+        self.scroll_area.setWidget(self.scroll_container)
+        self.scroll_area.setStyleSheet(
+            'QScrollArea { background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px; }'
+        )
+        root.addWidget(self.scroll_area, 1)
+
+        self.empty_label = QLabel('暂无摄像头，点击上方“扫描本机设备”或“添加网络摄像头”开始。', self.scroll_container)
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setStyleSheet('color:#8295b8; font-size:13px; padding: 40px 12px;')
+
+        params_card = QFrame(self)
+        params_card.setStyleSheet(
+            'QFrame { background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 14px; }'
+        )
+        params_layout = QHBoxLayout(params_card)
+        params_layout.setContentsMargins(16, 12, 16, 12)
+        params_layout.setSpacing(20)
+
+        res_box = QVBoxLayout()
+        res_box.setSpacing(4)
+        res_title = QLabel('采集分辨率', self)
+        res_title.setStyleSheet('color:#9fb1d6; font-size:12px; font-weight:600;')
+        self.combo_res = QComboBox(self)
+        self.combo_res.addItems(self.RESOLUTIONS)
+        current_res = f'{resolution[0]}x{resolution[1]}'
+        if current_res in self.RESOLUTIONS:
+            self.combo_res.setCurrentText(current_res)
+        else:
+            self.combo_res.addItem(current_res)
+            self.combo_res.setCurrentText(current_res)
+        res_box.addWidget(res_title)
+        res_box.addWidget(self.combo_res)
+
+        fps_box = QVBoxLayout()
+        fps_box.setSpacing(4)
+        fps_title = QLabel('目标帧率', self)
+        fps_title.setStyleSheet('color:#9fb1d6; font-size:12px; font-weight:600;')
+        self.spin_fps = QSpinBox(self)
+        self.spin_fps.setRange(5, 60)
+        self.spin_fps.setValue(int(fps))
+        fps_box.addWidget(fps_title)
+        fps_box.addWidget(self.spin_fps)
+
+        params_layout.addLayout(res_box, 1)
+        params_layout.addLayout(fps_box, 1)
+        root.addWidget(params_card)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(10)
+        footer.addStretch(1)
+        self.btn_cancel = QPushButton('取消', self)
+        self.btn_cancel.setCursor(Qt.PointingHandCursor)
+        self.btn_cancel.setFixedHeight(40)
+        self.btn_cancel.setMinimumWidth(100)
+        self.btn_cancel.setStyleSheet(
+            """
+            QPushButton {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 14px;
+                color: #dbe4fa;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: rgba(255, 255, 255, 0.10); }
+            """
+        )
+        self.btn_ok = self._make_primary_btn('一键接通', '#5d7cff', '#4aa5ff', height=40, min_width=140)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_ok.clicked.connect(self.accept)
+        footer.addWidget(self.btn_cancel)
+        footer.addWidget(self.btn_ok)
+        root.addLayout(footer)
+
+        self.btn_scan.clicked.connect(self._on_scan)
+        self.btn_add_url.clicked.connect(self._on_add_url)
+
+        self._refresh_list()
+
+    def _make_primary_btn(self, text: str, c1: str, c2: str, height: int = 36, min_width: int = 130) -> QPushButton:
+        btn = QPushButton(text, self)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedHeight(height)
+        btn.setMinimumWidth(min_width)
+        btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {c1}, stop:1 {c2});
+                border: 1px solid rgba(255, 255, 255, 0.22);
+                border-radius: 14px;
+                color: white;
+                font-size: 13px;
+                font-weight: 800;
+                padding: 0 16px;
+            }}
+            QPushButton:hover {{ border: 1px solid rgba(255, 255, 255, 0.45); }}
+            QPushButton:pressed {{ background: {c1}; }}
+            """
+        )
+        return btn
+
+    def _clear_rows(self):
+        for row in self._rows:
+            row.setParent(None)
+            row.deleteLater()
+        self._rows = []
+
+    def _refresh_list(self):
+        self._clear_rows()
+        self.empty_label.setParent(None)
+
+        for i, cam in enumerate(self.cameras):
+            row = CameraRow(i, cam, self.scroll_container)
+            row.toggled.connect(self._on_row_toggled)
+            row.rename_requested.connect(self._on_rename)
+            row.remove_requested.connect(self._on_remove)
+            self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
+            self._rows.append(row)
+
+        if not self.cameras:
+            self.rows_layout.insertWidget(0, self.empty_label)
+
+        enabled = sum(1 for c in self.cameras if c.get('enabled', True))
+        self.count_label.setText(f'共 {len(self.cameras)} 台  ·  已启用 {enabled} 台')
+
+    def _on_row_toggled(self, idx: int, checked: bool):
+        if 0 <= idx < len(self.cameras):
+            self.cameras[idx]['enabled'] = checked
+        enabled = sum(1 for c in self.cameras if c.get('enabled', True))
+        self.count_label.setText(f'共 {len(self.cameras)} 台  ·  已启用 {enabled} 台')
+
+    def _on_scan(self):
+        found = []
+        for i in range(8):
+            ok = False
+            for backend in (cv2.CAP_MSMF, cv2.CAP_DSHOW):
+                stream = cv2.VideoCapture(i, backend)
+                if stream.isOpened():
+                    ret, _ = stream.read()
+                    ok = bool(ret)
+                stream.release()
+                if ok:
+                    break
+            if ok:
+                found.append(i)
+
+        if not found:
+            QMessageBox.information(self, '扫描结果', '未检测到本机摄像头')
+            return
+
+        existing_values = {str(c['value']) for c in self.cameras if c.get('type') == 'camera'}
+        added = 0
+        for idx in found:
+            if str(idx) in existing_values:
+                continue
+            self.cameras.append({
+                'type': 'camera',
+                'value': idx,
+                'name': f'本机摄像头 {idx}',
+                'enabled': True,
+            })
+            added += 1
+        self._refresh_list()
+        QMessageBox.information(self, '扫描结果', f'检测到 {len(found)} 个设备，新增 {added} 个')
+
+    def _on_add_url(self):
+        url, ok = QInputDialog.getText(
+            self,
+            '添加网络摄像头',
+            '请输入 RTSP / HTTP 地址：',
+            text='rtsp://'
+        )
+        if not ok or not url.strip():
+            return
+        url = url.strip()
+        default_name = f'网络摄像头 {len(self.cameras) + 1}'
+        name, ok = QInputDialog.getText(self, '命名', '为该摄像头命名：', text=default_name)
+        if not ok:
+            return
+        name = name.strip() or default_name
+        self.cameras.append({'type': 'camera_url', 'value': url, 'name': name, 'enabled': True})
+        self._refresh_list()
+
+    def _on_rename(self, idx: int):
+        if not (0 <= idx < len(self.cameras)):
+            return
+        cam = self.cameras[idx]
+        name, ok = QInputDialog.getText(self, '重命名', '新名称：', text=cam['name'])
+        if not ok:
+            return
+        cam['name'] = name.strip() or cam['name']
+        self._refresh_list()
+
+    def _on_remove(self, idx: int):
+        if not (0 <= idx < len(self.cameras)):
+            return
+        confirm = QMessageBox.question(
+            self,
+            '删除摄像头',
+            f"确定删除 “{self.cameras[idx]['name']}” 吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        del self.cameras[idx]
+        self._refresh_list()
+
+    def result_cameras(self) -> List[dict]:
+        return self.cameras
+
+    def selected_resolution(self) -> Tuple[int, int]:
+        w, h = self.combo_res.currentText().split('x')
+        return int(w), int(h)
+
+    def selected_fps(self) -> int:
+        return int(self.spin_fps.value())
+
+
 class MyThread(QThread):
     send_img = Signal(np.ndarray)
     send_detectinfo_dic = Signal(dict)
@@ -148,6 +699,107 @@ class MyThread(QThread):
         self.target_fps = 20
         self.active_slots = 1
         self.sources_config: List[dict] = []
+        self.infer_every_n = 2
+        self.infer_size = 640
+
+        self._save_dir: Optional[Path] = None
+        self._csv_file = None
+        self._csv_writer = None
+        self._video_writers: Dict[str, cv2.VideoWriter] = {}
+        self._frame_count = 0
+        self._alarm_frames_saved = 0
+        self._total_detections: Dict[str, int] = {}
+        self._session_start: Optional[str] = None
+
+    def _init_save_session(self):
+        if self.is_save != Qt.Checked:
+            return
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._save_dir = Path('runs/detect') / f'exp_{ts}'
+        self._save_dir.mkdir(parents=True, exist_ok=True)
+        (self._save_dir / 'alarm_frames').mkdir(exist_ok=True)
+
+        csv_path = self._save_dir / 'detections.csv'
+        self._csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            '时间', '帧号', '源名称', '类别', '置信度', 'x1', 'y1', 'x2', 'y2'
+        ])
+
+        self._frame_count = 0
+        self._alarm_frames_saved = 0
+        self._total_detections = {}
+        self._session_start = datetime.now().isoformat()
+
+    def _save_detection_row(self, src_name: str, class_name: str, conf: float, xyxy):
+        if self._csv_writer is None:
+            return
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        x1, y1, x2, y2 = [int(v) for v in xyxy]
+        self._csv_writer.writerow([
+            now, self._frame_count, src_name, class_name, f'{conf:.4f}', x1, y1, x2, y2
+        ])
+        self._total_detections[class_name] = self._total_detections.get(class_name, 0) + 1
+
+    def _save_alarm_frame(self, frame: np.ndarray, src_name: str):
+        if self._save_dir is None:
+            return
+        if self._alarm_frames_saved >= 500:
+            return
+        self._alarm_frames_saved += 1
+        ts = datetime.now().strftime('%H%M%S_%f')[:-3]
+        filename = f'{src_name}_{ts}.jpg'
+        filepath = self._save_dir / 'alarm_frames' / filename
+        frame_copy = frame.copy()
+        threading.Thread(target=cv2.imwrite, args=(str(filepath), frame_copy), daemon=True).start()
+
+    def _get_video_writer(self, src_name: str, width: int, height: int) -> Optional[cv2.VideoWriter]:
+        if self._save_dir is None:
+            return None
+        if src_name in self._video_writers:
+            return self._video_writers[src_name]
+        safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in src_name)
+        filepath = self._save_dir / f'{safe_name}.mp4'
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(str(filepath), fourcc, self.target_fps, (width, height))
+        if writer.isOpened():
+            self._video_writers[src_name] = writer
+            return writer
+        return None
+
+    def _close_save_session(self):
+        for writer in self._video_writers.values():
+            try:
+                writer.release()
+            except Exception:
+                pass
+        self._video_writers = {}
+
+        if self._csv_file is not None:
+            self._csv_file.close()
+            self._csv_file = None
+            self._csv_writer = None
+
+        if self._save_dir is not None:
+            summary = {
+                'session_start': self._session_start,
+                'session_end': datetime.now().isoformat(),
+                'total_frames': self._frame_count,
+                'alarm_frames_saved': self._alarm_frames_saved,
+                'detection_counts': self._total_detections,
+                'sources': [s.get('name', '') for s in self.sources_config],
+                'resolution': list(self.target_resolution),
+                'fps': self.target_fps,
+                'conf_threshold': self.conf,
+                'iou_threshold': self.iou,
+                'weights': self.weights,
+            }
+            summary_path = self._save_dir / 'summary.json'
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, indent=4, ensure_ascii=False)
+
+            self.status_text.emit(f'结果已保存至: {self._save_dir}')
+        self._save_dir = None
 
     def _safe_speak(self, text: str):
         try:
@@ -187,16 +839,7 @@ class MyThread(QThread):
         panels = []
         for frame, name in valid[: max(1, self.active_slots)]:
             resized = cv2.resize(frame, (panel_w, panel_h))
-            cv2.putText(
-                resized,
-                name,
-                (14, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            draw_text_cn(resized, name, (14, 10), font_size=26, color_bgr=(0, 255, 255))
             panels.append(resized)
 
         cols = 2 if len(panels) > 1 else 1
@@ -238,6 +881,7 @@ class MyThread(QThread):
         det = pred[0]
         detect_counts = {}
 
+        src_name = Path(image_path).stem
         if len(det):
             det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
             for *xyxy, conf, cls in reversed(det):
@@ -245,8 +889,13 @@ class MyThread(QThread):
                 label = f'{names[c]} {conf:.2f}'
                 annotator.box_label(xyxy, label, color=colors(c, True))
                 detect_counts[names[c]] = detect_counts.get(names[c], 0) + 1
+                self._save_detection_row(src_name, names[c], float(conf), xyxy)
 
         result_img = annotator.result()
+
+        if self.is_save == Qt.Checked and self._save_dir is not None:
+            save_path = self._save_dir / f'{src_name}_result.jpg'
+            cv2.imwrite(str(save_path), result_img)
 
         # 发送结果
         self.send_img.emit(result_img)
@@ -265,6 +914,8 @@ class MyThread(QThread):
             self.status_text.emit('未配置检测源')
             return
 
+        self._init_save_session()
+
         # 处理图片检测
         if self.sources_config[0]['type'] == 'image':
             try:
@@ -272,19 +923,22 @@ class MyThread(QThread):
                 half = device.type != 'cpu'
                 model = DetectMultiBackend(self.weights, device=device, dnn=False, data='data/custom.yaml', fp16=half)
                 stride, names = model.stride, model.names
-                imgsz = check_img_size((640, 640), s=stride)
+                imgsz = check_img_size((self.infer_size, self.infer_size), s=stride)
                 if half:
                     model.half()
                 model.warmup(imgsz=(1, 3, *imgsz))
 
                 image_path = self.sources_config[0]['value']
                 self.status_text.emit(f'正在检测图片: {Path(image_path).name}')
+                self._frame_count = 1
                 self._detect_image(image_path, device, model, imgsz, names)
 
             except Exception as e:
                 self.alarm_state.emit(False)
                 self.status_text.emit(f'错误: {e}')
                 print(f'图片检测错误: {e}')
+            finally:
+                self._close_save_session()
             return
 
         capture = None
@@ -293,7 +947,7 @@ class MyThread(QThread):
             half = device.type != 'cpu'
             model = DetectMultiBackend(self.weights, device=device, dnn=False, data='data/custom.yaml', fp16=half)
             stride, names = model.stride, model.names
-            imgsz = check_img_size((640, 640), s=stride)
+            imgsz = check_img_size((self.infer_size, self.infer_size), s=stride)
             if half:
                 model.half()
             model.warmup(imgsz=(1, 3, *imgsz))
@@ -304,59 +958,86 @@ class MyThread(QThread):
             speak_thread = None
             fixed_text = '警报，警报，发现火情，请迅速处理！'
             infer_time_ms = 0.0
+            loop_index = 0
+            last_annotated: List[np.ndarray] = []
+            last_counts: Dict[str, int] = {}
+            last_alarm = False
 
             while not self.end_loop:
                 oks, frames = capture.read()
                 if not any(oks):
                     break
 
-                annotated_frames: List[np.ndarray] = []
-                merged_counts: Dict[str, int] = {}
-                frame_has_alarm = False
+                loop_index += 1
+                do_infer = (loop_index % self.infer_every_n == 0) or loop_index == 1
 
-                for ok, frame, src in zip(oks, frames, active_sources):
-                    if not ok or frame is None:
-                        blank = np.zeros((360, 640, 3), dtype=np.uint8)
-                        cv2.putText(blank, f"{src['name']} 无信号", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-                        annotated_frames.append(blank)
-                        continue
+                if not do_infer and last_annotated:
+                    annotated_frames = last_annotated
+                    merged_counts = last_counts
+                    frame_has_alarm = last_alarm
+                else:
+                    annotated_frames = []
+                    merged_counts = {}
+                    frame_has_alarm = False
 
-                    im0 = frame.copy()
-                    letter = self._letterbox(im0, imgsz)
-                    letter = letter[:, :, ::-1].transpose(2, 0, 1)
-                    letter = np.ascontiguousarray(letter)
+                    for ok, frame, src in zip(oks, frames, active_sources):
+                        if not ok or frame is None:
+                            blank = np.zeros((360, 640, 3), dtype=np.uint8)
+                            draw_text_cn(blank, f"{src['name']} 无信号", (20, 20), font_size=28, color_bgr=(0, 0, 255))
+                            annotated_frames.append(blank)
+                            continue
 
-                    t0 = time.time()
-                    im = torch.from_numpy(letter).to(model.device)
-                    im = im.half() if model.fp16 else im.float()
-                    im /= 255
-                    if len(im.shape) == 3:
-                        im = im[None]
+                        im0 = frame.copy()
+                        letter = self._letterbox(im0, imgsz)
+                        letter = letter[:, :, ::-1].transpose(2, 0, 1)
+                        letter = np.ascontiguousarray(letter)
 
-                    pred = model(im, augment=False, visualize=False)
-                    pred = non_max_suppression(pred, self.conf, self.iou, None, False, max_det=1000)
-                    infer_time_ms = (time.time() - t0) * 1000
+                        t0 = time.time()
+                        im = torch.from_numpy(letter).to(model.device)
+                        im = im.half() if model.fp16 else im.float()
+                        im /= 255
+                        if len(im.shape) == 3:
+                            im = im[None]
 
-                    annotator = Annotator(im0, line_width=2, example=str(names))
-                    det = pred[0]
-                    if len(det):
-                        frame_has_alarm = True
-                        det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
-                        for *xyxy, conf, cls in reversed(det):
-                            c = int(cls)
-                            label = f'{names[c]} {conf:.2f}'
-                            annotator.box_label(xyxy, label, color=colors(c, True))
-                            merged_counts[names[c]] = merged_counts.get(names[c], 0) + 1
+                        pred = model(im, augment=False, visualize=False)
+                        pred = non_max_suppression(pred, self.conf, self.iou, None, False, max_det=1000)
+                        infer_time_ms = (time.time() - t0) * 1000
 
-                    out = annotator.result()
-                    status = f"{src['name']} | {im0.shape[1]}x{im0.shape[0]} | {self.target_fps} FPS"
-                    cv2.putText(out, status, (12, im0.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2)
-                    annotated_frames.append(out)
+                        annotator = Annotator(im0, line_width=2, example=str(names))
+                        det = pred[0]
+                        if len(det):
+                            frame_has_alarm = True
+                            det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+                            for *xyxy, conf, cls in reversed(det):
+                                c = int(cls)
+                                label = f'{names[c]} {conf:.2f}'
+                                annotator.box_label(xyxy, label, color=colors(c, True))
+                                merged_counts[names[c]] = merged_counts.get(names[c], 0) + 1
+                                self._save_detection_row(src['name'], names[c], float(conf), xyxy)
+
+                        out = annotator.result()
+                        status = f"{src['name']} | {im0.shape[1]}x{im0.shape[0]} | {self.target_fps} FPS"
+                        draw_text_cn(out, status, (12, im0.shape[0] - 32), font_size=20, color_bgr=(0, 255, 255))
+                        annotated_frames.append(out)
+
+                        if self.is_save == Qt.Checked:
+                            writer = self._get_video_writer(src['name'], out.shape[1], out.shape[0])
+                            if writer is not None:
+                                writer.write(out)
+
+                    last_annotated = annotated_frames
+                    last_counts = merged_counts
+                    last_alarm = frame_has_alarm
 
                 mosaic = self._make_mosaic(annotated_frames, [s['name'] for s in active_sources])
                 self.send_img.emit(mosaic)
                 self.send_detectinfo_dic.emit(merged_counts)
                 self.detect_speed.emit(str(round(infer_time_ms, 1)))
+
+                self._frame_count += 1
+
+                if frame_has_alarm and self.is_save == Qt.Checked:
+                    self._save_alarm_frame(mosaic, 'mosaic')
 
                 if frame_has_alarm:
                     self._alarm_counter += 1
@@ -384,6 +1065,7 @@ class MyThread(QThread):
         finally:
             if capture is not None:
                 capture.release()
+            self._close_save_session()
 
 
 class MainWindow(QMainWindow, Ui_MainWindow):
@@ -415,6 +1097,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self._default_preview_active = True
         self._default_preview_message = '请从左侧选择图片、视频或摄像头，识别结果会居中显示在这里'
         self._last_frame = None
+        self.saved_cameras: List[dict] = []
 
         self.build_scifi_style()
         self.build_premium_layout()
@@ -464,8 +1147,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def _style_source_button(self, button: QPushButton, caption: str, tooltip: str) -> None:
         button.setToolTip(tooltip)
         button.setCursor(Qt.PointingHandCursor)
-        button.setFixedSize(68, 68)
-        button.setIconSize(QSize(28, 28))
+        button.setFixedSize(56, 56)
+        button.setIconSize(QSize(24, 24))
         if button.icon().isNull():
             button.setText(caption[:1])
             button.setStyleSheet(
@@ -513,20 +1196,20 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             )
 
     def _create_action_item(self, button: QPushButton, caption: str, tooltip: str) -> QFrame:
-        card = QFrame(self.left_panel)
+        card = QFrame()
         card.setStyleSheet(
             """
             QFrame {
                 background: rgba(255, 255, 255, 0.03);
                 border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 20px;
+                border-radius: 18px;
             }
             """
         )
-        card.setMinimumWidth(96)
+        card.setMinimumWidth(88)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(8, 10, 8, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 8, 6, 8)
+        layout.setSpacing(6)
 
         button.setParent(card)
         self._style_source_button(button, caption, tooltip)
@@ -661,24 +1344,45 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         )
         self._apply_shadow(self.left_panel, blur=34, y_offset=10, alpha=110)
 
-        left_layout = QVBoxLayout(self.left_panel)
-        left_layout.setContentsMargins(20, 22, 20, 22)
-        left_layout.setSpacing(18)
+        outer_layout = QVBoxLayout(self.left_panel)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
 
-        panel_title = QLabel('控制面板', self.left_panel)
+        self.left_scroll = QScrollArea(self.left_panel)
+        self.left_scroll.setWidgetResizable(True)
+        self.left_scroll.setFrameShape(QFrame.NoFrame)
+        self.left_scroll.setStyleSheet(
+            """
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: rgba(255, 255, 255, 0.02);
+                width: 8px; border-radius: 4px; margin: 4px 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(123, 156, 255, 0.30);
+                border-radius: 4px; min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover { background: rgba(123, 156, 255, 0.50); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            """
+        )
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet('background: transparent;')
+        left_layout = QVBoxLayout(scroll_content)
+        left_layout.setContentsMargins(18, 18, 18, 18)
+        left_layout.setSpacing(12)
+        self.left_scroll.setWidget(scroll_content)
+        outer_layout.addWidget(self.left_scroll)
+
+        panel_title = QLabel('控制面板', scroll_content)
         panel_title.setStyleSheet('color:#ffffff; font-size:16px; font-weight:800; letter-spacing:1px;')
         left_layout.addWidget(panel_title)
 
-        intro = QLabel('左侧控件已按功能重新分组，按钮横向整齐排列，适合直接开始识别。', self.left_panel)
-        intro.setWordWrap(True)
-        intro.setStyleSheet('color:#91a3c8; font-size:12px; line-height:1.6;')
-        left_layout.addWidget(intro)
-
-        left_layout.addWidget(self._create_section_title('模型权重', self.left_panel))
-        weights_wrap = QWidget(self.left_panel)
+        left_layout.addWidget(self._create_section_title('模型权重', scroll_content))
+        weights_wrap = QWidget(scroll_content)
         weights_layout = QHBoxLayout(weights_wrap)
         weights_layout.setContentsMargins(0, 0, 0, 0)
-        weights_layout.setSpacing(10)
+        weights_layout.setSpacing(8)
         self.lineEdit_weights.setParent(weights_wrap)
         self.lineEdit_weights.setPlaceholderText('请选择 .pt 权重文件')
         self.pushButton_weights.setParent(weights_wrap)
@@ -688,87 +1392,165 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         weights_layout.addWidget(self.pushButton_weights)
         left_layout.addWidget(weights_wrap)
 
-        left_layout.addWidget(self._create_section_title('检测源', self.left_panel))
-        source_wrap = QWidget(self.left_panel)
+        left_layout.addWidget(self._create_section_title('检测源', scroll_content))
+        source_wrap = QWidget(scroll_content)
         source_layout = QHBoxLayout(source_wrap)
         source_layout.setContentsMargins(0, 0, 0, 0)
-        source_layout.setSpacing(10)
+        source_layout.setSpacing(8)
         for attr, caption, tooltip in self.ACTION_META:
             source_layout.addWidget(self._create_action_item(getattr(self, attr), caption, tooltip))
         left_layout.addWidget(source_wrap)
 
-        left_layout.addWidget(self._create_section_title('识别参数', self.left_panel))
-        param_card = QFrame(self.left_panel)
-        param_card.setStyleSheet(
+        self.pushButton_manage_cams = QPushButton('管理摄像头', scroll_content)
+        self.pushButton_manage_cams.setCursor(Qt.PointingHandCursor)
+        self.pushButton_manage_cams.setToolTip('扫描本机 / 添加网络摄像头 / 重命名 / 删除 / 选择启用')
+        self.pushButton_manage_cams.setFixedHeight(36)
+        self.pushButton_manage_cams.setStyleSheet(
             """
-            QFrame {
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 20px;
+            QPushButton {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                border-radius: 12px;
+                color: #dde8ff;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.10);
+                border: 1px solid rgba(123, 156, 255, 0.40);
             }
             """
         )
+        left_layout.addWidget(self.pushButton_manage_cams)
+
+        left_layout.addWidget(self._create_section_title('识别参数', scroll_content))
+        param_card = QFrame(scroll_content)
+        param_card.setStyleSheet(
+            'QFrame { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; }'
+        )
         param_layout = QHBoxLayout(param_card)
-        param_layout.setContentsMargins(14, 14, 14, 14)
-        param_layout.setSpacing(12)
+        param_layout.setContentsMargins(12, 10, 12, 10)
+        param_layout.setSpacing(10)
 
         conf_box = QWidget(param_card)
         conf_layout = QVBoxLayout(conf_box)
         conf_layout.setContentsMargins(0, 0, 0, 0)
-        conf_layout.setSpacing(8)
+        conf_layout.setSpacing(4)
         conf_title = QLabel('置信度', conf_box)
         conf_title.setStyleSheet('color:#c8d7f4; font-size:12px; font-weight:700;')
         self.doubleSpinBox_conf.setParent(conf_box)
+        self.doubleSpinBox_conf.setMinimumWidth(120)
         conf_layout.addWidget(conf_title)
         conf_layout.addWidget(self.doubleSpinBox_conf)
 
         iou_box = QWidget(param_card)
         iou_layout = QVBoxLayout(iou_box)
         iou_layout.setContentsMargins(0, 0, 0, 0)
-        iou_layout.setSpacing(8)
+        iou_layout.setSpacing(4)
         iou_title = QLabel('IOU 阈值', iou_box)
         iou_title.setStyleSheet('color:#c8d7f4; font-size:12px; font-weight:700;')
         self.doubleSpinBox_iou.setParent(iou_box)
+        self.doubleSpinBox_iou.setMinimumWidth(120)
         iou_layout.addWidget(iou_title)
         iou_layout.addWidget(self.doubleSpinBox_iou)
 
-        param_layout.addWidget(conf_box)
-        param_layout.addWidget(iou_box)
+        param_layout.addWidget(conf_box, 1)
+        param_layout.addWidget(iou_box, 1)
         left_layout.addWidget(param_card)
 
-        left_layout.addWidget(self._create_section_title('运行选项', self.left_panel))
-        option_card = QFrame(self.left_panel)
-        option_card.setStyleSheet(
+        left_layout.addWidget(self._create_section_title('性能调优', scroll_content))
+        perf_card = QFrame(scroll_content)
+        perf_card.setStyleSheet(
+            'QFrame { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; }'
+        )
+        perf_layout = QHBoxLayout(perf_card)
+        perf_layout.setContentsMargins(12, 10, 12, 10)
+        perf_layout.setSpacing(10)
+
+        infer_size_box = QWidget(perf_card)
+        infer_size_layout = QVBoxLayout(infer_size_box)
+        infer_size_layout.setContentsMargins(0, 0, 0, 0)
+        infer_size_layout.setSpacing(4)
+        infer_size_title = QLabel('推理尺寸', infer_size_box)
+        infer_size_title.setStyleSheet('color:#c8d7f4; font-size:12px; font-weight:700;')
+        self.combo_infer_size = QComboBox(infer_size_box)
+        self.combo_infer_size.addItems(['320', '416', '512', '640'])
+        self.combo_infer_size.setCurrentText(str(self.my_thread.infer_size))
+        self.combo_infer_size.setMinimumWidth(100)
+        self.combo_infer_size.setMinimumHeight(36)
+        self.combo_infer_size.setStyleSheet(
+            'QComboBox { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10); '
+            'border-radius: 10px; color: #f7f9ff; padding: 6px 10px; font-size: 13px; }'
+            'QComboBox QAbstractItemView { background: #0f1a30; color: #eef3ff; '
+            'selection-background-color: rgba(86,117,255,0.55); border: 1px solid rgba(255,255,255,0.10); }'
+        )
+        infer_size_layout.addWidget(infer_size_title)
+        infer_size_layout.addWidget(self.combo_infer_size)
+
+        skip_box = QWidget(perf_card)
+        skip_layout = QVBoxLayout(skip_box)
+        skip_layout.setContentsMargins(0, 0, 0, 0)
+        skip_layout.setSpacing(4)
+        skip_title = QLabel('跳帧推理', skip_box)
+        skip_title.setStyleSheet('color:#c8d7f4; font-size:12px; font-weight:700;')
+        self.combo_skip_frame = QComboBox(skip_box)
+        self.combo_skip_frame.addItems(['每帧推理', '每2帧', '每3帧', '每4帧'])
+        self.combo_skip_frame.setCurrentIndex(max(0, self.my_thread.infer_every_n - 1))
+        self.combo_skip_frame.setMinimumWidth(100)
+        self.combo_skip_frame.setMinimumHeight(36)
+        self.combo_skip_frame.setStyleSheet(
+            'QComboBox { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10); '
+            'border-radius: 10px; color: #f7f9ff; padding: 6px 10px; font-size: 13px; }'
+            'QComboBox QAbstractItemView { background: #0f1a30; color: #eef3ff; '
+            'selection-background-color: rgba(86,117,255,0.55); border: 1px solid rgba(255,255,255,0.10); }'
+        )
+        skip_layout.addWidget(skip_title)
+        skip_layout.addWidget(self.combo_skip_frame)
+
+        perf_layout.addWidget(infer_size_box, 1)
+        perf_layout.addWidget(skip_box, 1)
+        left_layout.addWidget(perf_card)
+
+        left_layout.addWidget(self._create_section_title('运行选项', scroll_content))
+        option_row = QHBoxLayout()
+        option_row.setSpacing(16)
+        self.checkBox_is_alarm.setParent(scroll_content)
+        self.checkBox_is_alarm.setText('报警联动')
+        self.checkBox_is_save.setParent(scroll_content)
+        self.checkBox_is_save.setText('保存结果')
+        option_row.addWidget(self.checkBox_is_alarm)
+        option_row.addWidget(self.checkBox_is_save)
+        option_row.addStretch(1)
+        left_layout.addLayout(option_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.pushButton_open_output = QPushButton('打开输出目录', scroll_content)
+        self.pushButton_open_output.setCursor(Qt.PointingHandCursor)
+        self.pushButton_open_output.setToolTip('打开保存检测结果的文件夹 (runs/detect)')
+        self.pushButton_open_output.setFixedHeight(36)
+        self.pushButton_open_output.setStyleSheet(
             """
-            QFrame {
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 20px;
+            QPushButton {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                border-radius: 12px;
+                color: #dde8ff;
+                font-weight: 600;
+                padding: 0 14px;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.10);
+                border: 1px solid rgba(123, 156, 255, 0.40);
             }
             """
         )
-        option_layout = QVBoxLayout(option_card)
-        option_layout.setContentsMargins(16, 14, 16, 14)
-        option_layout.setSpacing(12)
-        self.checkBox_is_alarm.setParent(option_card)
-        self.checkBox_is_alarm.setText('报警联动')
-        self.checkBox_is_save.setParent(option_card)
-        self.checkBox_is_save.setText('保存结果')
-        option_layout.addWidget(self.checkBox_is_alarm)
-        option_layout.addWidget(self.checkBox_is_save)
-        left_layout.addWidget(option_card)
-
-        info_chip = QLabel('支持图片、视频、摄像头三种模式快速切换', self.left_panel)
-        info_chip.setAlignment(Qt.AlignCenter)
-        info_chip.setStyleSheet(
-            'background: rgba(93, 130, 255, 0.12); border: 1px solid rgba(108, 146, 255, 0.24); '
-            'border-radius: 16px; color:#cddcff; padding: 10px 12px; font-size:12px;'
-        )
-        left_layout.addWidget(info_chip)
+        btn_row.addWidget(self.pushButton_open_output)
+        btn_row.addStretch(1)
+        left_layout.addLayout(btn_row)
 
         left_layout.addStretch(1)
 
-        self.pushButton_zz.setParent(self.left_panel)
+        self.pushButton_zz.setParent(scroll_content)
         self.pushButton_zz.setText('停止 / 复位')
         self.pushButton_zz.setCursor(Qt.PointingHandCursor)
         left_layout.addWidget(self.pushButton_zz)
@@ -782,8 +1564,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.pushButton_logo.setText('')
 
     def adjust_control_sizes(self):
-        self.lineEdit_weights.setMinimumHeight(46)
-        self.pushButton_weights.setMinimumSize(92, 46)
+        self.lineEdit_weights.setMinimumHeight(40)
+        self.lineEdit_weights.setStyleSheet(
+            'QLineEdit { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10); '
+            'border-radius: 10px; color: #f6f8ff; padding: 8px 12px; font-size: 13px; }'
+            'QLineEdit:focus { border: 1px solid rgba(117,154,255,0.92); }'
+        )
+        self.pushButton_weights.setMinimumSize(72, 40)
         self.pushButton_weights.setStyleSheet(
             """
             QPushButton {
@@ -808,17 +1595,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             QDoubleSpinBox {
                 background: rgba(255, 255, 255, 0.05);
                 border: 1px solid rgba(255, 255, 255, 0.10);
-                border-radius: 14px;
+                border-radius: 10px;
                 color: #f7f9ff;
-                padding: 10px 12px;
-                font-size: 13px;
-                min-height: 24px;
+                padding: 6px 10px;
+                font-size: 14px;
+                min-width: 90px;
+                min-height: 32px;
             }
             QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                width: 22px;
-                border-radius: 8px;
+                width: 24px;
+                border-radius: 6px;
                 background: rgba(255, 255, 255, 0.06);
-                margin: 4px;
+                margin: 3px;
             }
             QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
                 background: rgba(255, 255, 255, 0.12);
@@ -826,14 +1614,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """
         self.doubleSpinBox_conf.setStyleSheet(spin_style)
         self.doubleSpinBox_iou.setStyleSheet(spin_style)
-        self.doubleSpinBox_conf.setMinimumHeight(48)
-        self.doubleSpinBox_iou.setMinimumHeight(48)
+        self.doubleSpinBox_conf.setMinimumHeight(40)
+        self.doubleSpinBox_iou.setMinimumHeight(40)
+        self.doubleSpinBox_conf.setMinimumWidth(120)
+        self.doubleSpinBox_iou.setMinimumWidth(120)
         self.doubleSpinBox_conf.setDecimals(2)
         self.doubleSpinBox_iou.setDecimals(2)
         self.doubleSpinBox_conf.setSingleStep(0.01)
         self.doubleSpinBox_iou.setSingleStep(0.01)
 
-        self.pushButton_zz.setMinimumHeight(50)
+        self.pushButton_zz.setMinimumHeight(44)
         self.pushButton_zz.setStyleSheet(
             """
             QPushButton {
@@ -862,12 +1652,25 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.pushButton_img.clicked.connect(self.select_images)
         self.pushButton_video.clicked.connect(self.check_video)
         self.pushButton_camera.clicked.connect(self.open_camera)
+        self.pushButton_manage_cams.clicked.connect(self.manage_cameras)
         self.doubleSpinBox_conf.valueChanged.connect(self.change_conf)
         self.doubleSpinBox_iou.valueChanged.connect(self.change_iou)
         self.pushButton_weights.clicked.connect(self.select_weights)
         self.pushButton_zz.clicked.connect(self.clean)
+        self.pushButton_open_output.clicked.connect(self.open_output_dir)
         self.checkBox_is_alarm.clicked.connect(self.is_alarm)
         self.checkBox_is_save.clicked.connect(self.is_save)
+        self.combo_infer_size.currentTextChanged.connect(self.change_infer_size)
+        self.combo_skip_frame.currentIndexChanged.connect(self.change_skip_frame)
+
+    def change_infer_size(self, text: str):
+        try:
+            self.my_thread.infer_size = int(text)
+        except ValueError:
+            pass
+
+    def change_skip_frame(self, index: int):
+        self.my_thread.infer_every_n = max(1, index + 1)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -879,7 +1682,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         header_h = 52
         body_top = 92
         gap = 18
-        panel_w = 360
+        panel_w = min(420, max(360, int(self.width() * 0.28)))
         status_h = max(28, self.statusbar.sizeHint().height())
         available_h = self.height() - body_top - status_h - 22
         available_h = max(540, available_h)
@@ -1042,6 +1845,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def show_status(self, text):
         self.statusbar.showMessage(text)
 
+    def open_output_dir(self):
+        output_dir = Path('runs/detect')
+        if not output_dir.exists():
+            output_dir.mkdir(parents=True, exist_ok=True)
+        abs_path = str(output_dir.resolve())
+        if sys.platform == 'win32':
+            os.startfile(abs_path)
+        elif sys.platform == 'darwin':
+            os.system(f'open "{abs_path}"')
+        else:
+            os.system(f'xdg-open "{abs_path}"')
+
     def clean(self):
         self.my_thread.end_loop = True
         if self.my_thread.isRunning():
@@ -1094,7 +1909,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.my_thread.source_name = f'视频源 x {len(video_paths)}'
         self.start_detect()
 
-    def get_camera_num(self):
+    def _scan_local_cameras(self) -> List[int]:
         device_list = []
         for i in range(8):
             ok = False
@@ -1108,46 +1923,81 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     break
             if ok:
                 device_list.append(i)
-        return len(device_list), device_list
+        return device_list
 
-    def open_camera(self):
+    def _auto_populate_cameras_if_empty(self) -> bool:
+        if self.saved_cameras:
+            return False
+        found = self._scan_local_cameras()
+        for i, idx in enumerate(found):
+            self.saved_cameras.append({
+                'type': 'camera',
+                'value': idx,
+                'name': f'本机摄像头 {idx}',
+                'enabled': i == 0,
+            })
+        return bool(found)
+
+    def manage_cameras(self):
         if self.my_thread.isRunning():
             self.clean()
 
-        picked = self._choose_resolution_and_fps()
-        if picked is None:
-            return
-        self.my_thread.target_resolution, self.my_thread.target_fps = picked
-
-        num, device_list = self.get_camera_num()
-        if num == 0:
-            QMessageBox.warning(self, '出错啦', '<p>未检测到有效的摄像头</p>')
-            return
-
-        manual, ok = QInputDialog.getText(
-            self,
-            '多摄像头输入',
-            f'可用摄像头编号: {", ".join(str(i) for i in device_list)}\n请输入要识别的编号，逗号分隔：',
-            text=','.join(str(i) for i in device_list[: min(2, len(device_list))])
+        dialog = CameraManagerDialog(
+            self.saved_cameras,
+            self.my_thread.target_resolution,
+            self.my_thread.target_fps,
+            parent=self,
         )
-        if not ok or not manual.strip():
+        if dialog.exec() != QDialog.Accepted:
             return
 
-        indexes = []
-        for part in manual.split(','):
-            part = part.strip()
-            if part.isdigit():
-                idx = int(part)
-                if idx in device_list and idx not in indexes:
-                    indexes.append(idx)
+        self.saved_cameras = dialog.result_cameras()
+        self.my_thread.target_resolution = dialog.selected_resolution()
+        self.my_thread.target_fps = dialog.selected_fps()
+        self._start_enabled_cameras(silent=False)
 
-        if not indexes:
-            QMessageBox.warning(self, '提示', '未输入有效摄像头编号')
+    def open_camera(self):
+        """一键接通：已保存的启用项直接启动；若从未保存过则自动扫描本机并启动。"""
+        if self.my_thread.isRunning():
+            self.clean()
+
+        if not self.saved_cameras:
+            scanned = self._auto_populate_cameras_if_empty()
+            if not scanned:
+                QMessageBox.information(
+                    self,
+                    '没有可用摄像头',
+                    '未检测到本机摄像头。\n点击"管理摄像头"添加网络摄像头（RTSP / HTTP）后再试。'
+                )
+                self.manage_cameras()
+                return
+            self.statusbar.showMessage(f'已自动发现 {len(self.saved_cameras)} 个本机摄像头，正在接通第 1 个')
+
+        enabled = [c for c in self.saved_cameras if c.get('enabled', True)]
+        if not enabled:
+            QMessageBox.information(
+                self,
+                '未启用任何摄像头',
+                '请在"管理摄像头"中勾选至少一个需要启用的摄像头。'
+            )
+            self.manage_cameras()
             return
 
-        self.my_thread.sources_config = [{'type': 'camera', 'value': idx, 'name': f'摄像头 {idx}'} for idx in indexes]
-        self.my_thread.active_slots = len(self.my_thread.sources_config)
-        self.my_thread.source_name = f'摄像头源 x {len(indexes)}'
+        self._start_enabled_cameras(silent=False)
+
+    def _start_enabled_cameras(self, silent: bool = False):
+        enabled = [c for c in self.saved_cameras if c.get('enabled', True)]
+        if not enabled:
+            if not silent:
+                QMessageBox.information(self, '提示', '请至少启用一个摄像头')
+            return
+
+        self.my_thread.sources_config = [
+            {'type': c['type'], 'value': c['value'], 'name': c['name']}
+            for c in enabled
+        ]
+        self.my_thread.active_slots = len(enabled)
+        self.my_thread.source_name = f'摄像头源 x {len(enabled)}'
         self.start_detect()
 
     def change_conf(self, x):
@@ -1276,6 +2126,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.my_thread.is_save = loaded_config.get('is_save', Qt.Unchecked)
             self.my_thread.target_fps = int(loaded_config.get('target_fps', 20))
             self.my_thread.target_resolution = tuple(loaded_config.get('target_resolution', [1280, 720]))
+            self.saved_cameras = [dict(c) for c in loaded_config.get('cameras', [])]
+            self.my_thread.infer_size = int(loaded_config.get('infer_size', 640))
+            self.my_thread.infer_every_n = int(loaded_config.get('infer_every_n', 2))
         except Exception:
             self.my_thread.weights = 'fire.pt'
             self.my_thread.conf = 0.25
@@ -1288,6 +2141,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.doubleSpinBox_conf.setProperty('value', self.my_thread.conf)
         self.doubleSpinBox_iou.setProperty('value', self.my_thread.iou)
         self.lineEdit_weights.setText(self.my_thread.weights)
+        self.combo_infer_size.setCurrentText(str(self.my_thread.infer_size))
+        self.combo_skip_frame.setCurrentIndex(max(0, self.my_thread.infer_every_n - 1))
 
         if self.my_thread.is_save == 'checked':
             self.checkBox_is_save.setCheckState(Qt.Checked)
@@ -1321,6 +2176,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 'is_alarm': 'checked' if self.my_thread.is_alarm == Qt.Checked else 'Unchecked',
                 'target_fps': self.my_thread.target_fps,
                 'target_resolution': list(self.my_thread.target_resolution),
+                'cameras': self.saved_cameras,
+                'infer_size': self.my_thread.infer_size,
+                'infer_every_n': self.my_thread.infer_every_n,
             }
             with open('config.json', 'w', encoding='utf-8') as jsonfile:
                 json.dump(config, jsonfile, indent=4, ensure_ascii=False)
